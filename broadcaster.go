@@ -1,4 +1,5 @@
-package broadcastx
+// Package broadcaster enhances the Cosmos SDK broadcasts.
+package broadcaster
 
 import (
 	"context"
@@ -33,6 +34,12 @@ type TransactionRequest struct {
 type TransactionResult struct {
 	Response interface{}
 	Error    error
+}
+
+type broadcastLogContext struct {
+	accountKey AccountKey
+	msgCount   int
+	reqCount   int
 }
 
 // Broadcaster manages transaction queuing and broadcasting for accounts.
@@ -117,8 +124,10 @@ func (b *Broadcaster) Broadcast(ctx context.Context, msgs []sdk.Msg) <-chan Tran
 	return resultCh
 }
 
-// run processes the transaction queue, grouping messages and broadcasting them sequentially.
-// While broadcasting one transaction, it continues collecting messages for the next transaction.
+// run processes the transaction queue. It waits for the first transaction request,
+// then transitions to continuous broadcasting mode to drain the queue efficiently.
+// This design allows the broadcaster to be idle (blocking on the queue) when there's
+// no traffic, but switch to active polling mode when messages start arriving.
 func (b *Broadcaster) run() {
 	defer b.wg.Done()
 
@@ -128,150 +137,116 @@ func (b *Broadcaster) run() {
 			b.flushPending()
 			return
 		case req := <-b.queue:
+			// First message arrived - add to pending and immediately start continuous broadcasting
 			b.mu.Lock()
 			b.pending = append(b.pending, req.Messages...)
 			b.pendingReqs = append(b.pendingReqs, req)
-			pending := b.pending
-			pendingReqs := b.pendingReqs
-			b.pending = nil
-			b.pendingReqs = nil
 			b.mu.Unlock()
 
-			// Start collecting messages for the next batch in parallel with broadcasting
-			nextBatchCh := make(chan struct {
-				msgs []sdk.Msg
-				reqs []TransactionRequest
-			}, 1)
-
-			// Start goroutine to collect messages while broadcasting
-			go func() {
-				// Collect messages that arrive during the broadcast
-				// Keep collecting until broadcast completes
-				collectedMsgs := []sdk.Msg{}
-				collectedReqs := []TransactionRequest{}
-
-				// Wait a bit to see if more messages arrive quickly
-				timeout := time.After(50 * time.Millisecond)
-				collecting := true
-
-				for collecting {
-					select {
-					case req := <-b.queue:
-						collectedMsgs = append(collectedMsgs, req.Messages...)
-						collectedReqs = append(collectedReqs, req)
-						// Reset timeout to continue collecting
-						timeout = time.After(50 * time.Millisecond)
-					case <-timeout:
-						collecting = false
-					case <-b.ctx.Done():
-						collecting = false
-					}
-				}
-
-				nextBatchCh <- struct {
-					msgs []sdk.Msg
-					reqs []TransactionRequest
-				}{collectedMsgs, collectedReqs}
-			}()
-
-			// Broadcast the current batch (this blocks until transaction is included)
-			b.broadcastGrouped(pending, pendingReqs)
-
-			// Get the messages that were collected during the broadcast
-			select {
-			case nextBatch := <-nextBatchCh:
-				if len(nextBatch.msgs) > 0 {
-					// Broadcast the next batch immediately
-					b.broadcastGrouped(nextBatch.msgs, nextBatch.reqs)
-					// Continue collecting and broadcasting in a loop
-					b.continueBroadcasting()
-				}
-			case <-b.ctx.Done():
-				return
-			}
+			// Switch to active mode: drain the queue with overlapped collection/broadcast
+			b.continueBroadcasting()
+			// When continueBroadcasting returns, queue is empty - go back to blocking wait
 		}
 	}
 }
 
-// continueBroadcasting continuously collects and broadcasts messages.
-// This is called after the initial broadcast to keep processing queued messages.
+// continueBroadcasting actively drains the queue, broadcasting batches with overlapped
+// collection. This method runs in a loop until the queue is empty, optimizing throughput
+// by collecting the next batch while broadcasting the current batch.
+//
+// The workflow for each iteration:
+// 1. Collect pending messages from the queue (with 50ms timeout)
+// 2. If messages collected, start a goroutine to collect the NEXT batch in parallel
+// 3. Broadcast the current batch (blocks until transaction confirms)
+// 4. Retrieve the next batch that was collected during step 3
+// 5. If next batch has messages, continue the loop; otherwise return to idle mode
+//
+// This overlapping design minimizes idle time between broadcasts, ensuring back-to-back
+// transactions are sent as quickly as the blockchain can process them.
 func (b *Broadcaster) continueBroadcasting() {
+	var currentMsgs []sdk.Msg
+	var currentReqs []TransactionRequest
+
 	for {
-		// Collect messages
-		collectedMsgs := []sdk.Msg{}
-		collectedReqs := []TransactionRequest{}
+		// Collect current batch of messages (if we don't already have one from previous iteration)
+		if len(currentMsgs) == 0 {
+			currentMsgs, currentReqs = b.collectBatch()
 
-		timeout := time.After(50 * time.Millisecond)
-		collecting := true
-
-		for collecting {
-			select {
-			case req := <-b.queue:
-				collectedMsgs = append(collectedMsgs, req.Messages...)
-				collectedReqs = append(collectedReqs, req)
-				timeout = time.After(50 * time.Millisecond)
-			case <-timeout:
-				collecting = false
-			case <-b.ctx.Done():
+			// If no messages were collected, queue is empty - return to idle mode
+			if len(currentMsgs) == 0 {
 				return
 			}
 		}
 
-		if len(collectedMsgs) == 0 {
-			// No more messages, return to main loop
-			return
-		}
+		b.logger.InfoContext(b.ctx, "broadcasting batch",
+			"message_count", len(currentMsgs),
+			"request_count", len(currentReqs))
 
-		// Start collecting next batch while broadcasting current batch
+		// Start collecting next batch in parallel while we broadcast current batch
 		nextBatchCh := make(chan struct {
 			msgs []sdk.Msg
 			reqs []TransactionRequest
 		}, 1)
 
 		go func() {
-			collectedMsgs := []sdk.Msg{}
-			collectedReqs := []TransactionRequest{}
-
-			timeout := time.After(50 * time.Millisecond)
-			collecting := true
-
-			for collecting {
-				select {
-				case req := <-b.queue:
-					collectedMsgs = append(collectedMsgs, req.Messages...)
-					collectedReqs = append(collectedReqs, req)
-					timeout = time.After(50 * time.Millisecond)
-				case <-timeout:
-					collecting = false
-				case <-b.ctx.Done():
-					collecting = false
-				}
-			}
-
+			msgs, reqs := b.collectBatch()
 			nextBatchCh <- struct {
 				msgs []sdk.Msg
 				reqs []TransactionRequest
-			}{collectedMsgs, collectedReqs}
+			}{msgs, reqs}
 		}()
 
-		// Broadcast current batch
-		b.broadcastGrouped(collectedMsgs, collectedReqs)
+		// Broadcast current batch (blocks until transaction is included in a block)
+		b.broadcastGrouped(currentMsgs, currentReqs)
 
-		// Get next batch
+		// Retrieve the next batch that was collected during broadcast
 		select {
 		case nextBatch := <-nextBatchCh:
-			if len(nextBatch.msgs) > 0 {
-				collectedMsgs = nextBatch.msgs
-				collectedReqs = nextBatch.reqs
-				// Continue loop to broadcast this batch
-				continue
-			} else {
+			if len(nextBatch.msgs) == 0 {
+				// No more messages arrived - return to idle mode
 				return
 			}
+			// Next batch has messages - set them as current and continue loop to broadcast them
+			currentMsgs = nextBatch.msgs
+			currentReqs = nextBatch.reqs
 		case <-b.ctx.Done():
 			return
 		}
 	}
+}
+
+// collectBatch collects messages from the queue with a timeout.
+// It drains any pending messages from b.pending first, then actively polls
+// the queue for up to 50ms to batch additional messages together.
+// Returns the collected messages and their corresponding requests.
+func (b *Broadcaster) collectBatch() ([]sdk.Msg, []TransactionRequest) {
+	// First, drain any existing pending messages
+	b.mu.Lock()
+	msgs := b.pending
+	reqs := b.pendingReqs
+	b.pending = nil
+	b.pendingReqs = nil
+	b.mu.Unlock()
+
+	// Then poll the queue for a short time to collect additional messages
+	timeout := time.After(50 * time.Millisecond)
+	collecting := true
+
+	for collecting {
+		select {
+		case req := <-b.queue:
+			msgs = append(msgs, req.Messages...)
+			reqs = append(reqs, req)
+			// Reset timeout to continue collecting while messages keep arriving
+			timeout = time.After(50 * time.Millisecond)
+		case <-timeout:
+			collecting = false
+		case <-b.ctx.Done():
+			collecting = false
+		}
+	}
+
+	return msgs, reqs
 }
 
 // broadcastGrouped broadcasts a group of messages and sends results to all waiting requesters.
@@ -286,11 +261,12 @@ func (b *Broadcaster) broadcastGrouped(msgs []sdk.Msg, reqs []TransactionRequest
 		b.mu.Unlock()
 	}()
 
-	b.logger.InfoContext(b.ctx, "Broadcasting grouped transaction",
-		"account", b.accountKey.Address,
-		"chain_id", b.accountKey.ChainID,
-		"msg_count", len(msgs),
-		"req_count", len(reqs),
+	b.logger.InfoContext(b.ctx, "broadcasting grouped transaction",
+		"broadcast_context", broadcastLogContext{
+			accountKey: b.accountKey,
+			msgCount:   len(msgs),
+			reqCount:   len(reqs),
+		},
 	)
 
 	txResp, err := b.broadcastFunc(b.ctx, msgs)
@@ -315,14 +291,20 @@ func (b *Broadcaster) broadcastGrouped(msgs []sdk.Msg, reqs []TransactionRequest
 
 	if err != nil {
 		b.logger.ErrorContext(b.ctx, "Transaction broadcast failed",
-			"account", b.accountKey.Address,
 			"error", err.Error(),
-			"msg_count", len(msgs),
+			"broadcast_context", broadcastLogContext{
+				accountKey: b.accountKey,
+				msgCount:   len(msgs),
+				reqCount:   len(reqs),
+			},
 		)
 	} else {
 		b.logger.InfoContext(b.ctx, "Transaction broadcast successful",
-			"account", b.accountKey.Address,
-			"msg_count", len(msgs),
+			"broadcast_context", broadcastLogContext{
+				accountKey: b.accountKey,
+				msgCount:   len(msgs),
+				reqCount:   len(reqs),
+			},
 		)
 	}
 }
