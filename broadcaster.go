@@ -58,6 +58,7 @@ type Broadcaster struct {
 	pending       []sdk.Msg
 	pendingReqs   []TransactionRequest
 	broadcasting  bool
+	config        broadcasterConfig
 }
 
 // NewBroadcaster creates a new broadcaster for the given account.
@@ -66,7 +67,7 @@ type Broadcaster struct {
 // The logger parameter accepts an slog.Logger.
 // The broadcastFunc is called to broadcast messages to the blockchain.
 // The fromAddress is the address of the account that will sign transactions.
-func NewBroadcaster(ctx context.Context, broadcastFunc BroadcastFunc, accountKey AccountKey, fromAddress string, logger *slog.Logger) *Broadcaster {
+func NewBroadcaster(ctx context.Context, broadcastFunc BroadcastFunc, accountKey AccountKey, fromAddress string, logger *slog.Logger, opts ...Option) *Broadcaster {
 	// Use background context so broadcasts aren't canceled when Terraform operations complete
 	// We still track the original context for shutdown signals
 	bctx, cancel := context.WithCancel(context.Background())
@@ -74,6 +75,11 @@ func NewBroadcaster(ctx context.Context, broadcastFunc BroadcastFunc, accountKey
 	// Use default logger if none provided
 	if logger == nil {
 		logger = slog.Default()
+	}
+
+	cfg := defaultConfig()
+	for _, o := range opts {
+		o(&cfg)
 	}
 
 	b := &Broadcaster{
@@ -84,6 +90,7 @@ func NewBroadcaster(ctx context.Context, broadcastFunc BroadcastFunc, accountKey
 		ctx:           bctx,
 		cancel:        cancel,
 		logger:        logger,
+		config:        cfg,
 	}
 	b.wg.Add(1)
 	go b.run()
@@ -197,7 +204,7 @@ func (b *Broadcaster) continueBroadcasting() {
 		}()
 
 		// Broadcast current batch (blocks until transaction is included in a block)
-		b.broadcastGrouped(currentMsgs, currentReqs)
+		b.broadcastWithRetry(currentMsgs, currentReqs)
 
 		// Retrieve the next batch that was collected during broadcast
 		select {
@@ -249,66 +256,6 @@ func (b *Broadcaster) collectBatch() ([]sdk.Msg, []TransactionRequest) {
 	return msgs, reqs
 }
 
-// broadcastGrouped broadcasts a group of messages and sends results to all waiting requesters.
-func (b *Broadcaster) broadcastGrouped(msgs []sdk.Msg, reqs []TransactionRequest) {
-	b.mu.Lock()
-	b.broadcasting = true
-	b.mu.Unlock()
-
-	defer func() {
-		b.mu.Lock()
-		b.broadcasting = false
-		b.mu.Unlock()
-	}()
-
-	b.logger.InfoContext(b.ctx, "broadcasting grouped transaction",
-		"broadcast_context", broadcastLogContext{
-			accountKey: b.accountKey,
-			msgCount:   len(msgs),
-			reqCount:   len(reqs),
-		},
-	)
-
-	txResp, err := b.broadcastFunc(b.ctx, msgs)
-
-	result := TransactionResult{
-		Response: txResp,
-		Error:    err,
-	}
-
-	// Send result to all requesters (non-blocking)
-	for _, req := range reqs {
-		select {
-		case req.ResultCh <- result:
-			// Successfully sent
-		default:
-			// Channel is full or closed - shouldn't happen with buffered channel, but handle gracefully
-			b.logger.WarnContext(b.ctx, "Failed to send result to requester",
-				"account", b.accountKey.Address,
-			)
-		}
-	}
-
-	if err != nil {
-		b.logger.ErrorContext(b.ctx, "Transaction broadcast failed",
-			"error", err.Error(),
-			"broadcast_context", broadcastLogContext{
-				accountKey: b.accountKey,
-				msgCount:   len(msgs),
-				reqCount:   len(reqs),
-			},
-		)
-	} else {
-		b.logger.InfoContext(b.ctx, "Transaction broadcast successful",
-			"broadcast_context", broadcastLogContext{
-				accountKey: b.accountKey,
-				msgCount:   len(msgs),
-				reqCount:   len(reqs),
-			},
-		)
-	}
-}
-
 // flushPending broadcasts any remaining pending messages.
 func (b *Broadcaster) flushPending() {
 	b.mu.Lock()
@@ -319,7 +266,7 @@ func (b *Broadcaster) flushPending() {
 	b.mu.Unlock()
 
 	if len(pending) > 0 {
-		b.broadcastGrouped(pending, pendingReqs)
+		b.broadcastWithRetry(pending, pendingReqs)
 	}
 }
 
@@ -357,7 +304,7 @@ func NewRegistry(logger *slog.Logger) *Registry {
 
 // GetOrCreateBroadcaster returns an existing broadcaster for the given account key,
 // or creates a new one if it doesn't exist.
-func (r *Registry) GetOrCreateBroadcaster(ctx context.Context, broadcastFunc BroadcastFunc, key AccountKey, fromAddress string) *Broadcaster {
+func (r *Registry) GetOrCreateBroadcaster(ctx context.Context, broadcastFunc BroadcastFunc, key AccountKey, fromAddress string, opts ...Option) *Broadcaster {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -365,7 +312,7 @@ func (r *Registry) GetOrCreateBroadcaster(ctx context.Context, broadcastFunc Bro
 		return b
 	}
 
-	b := NewBroadcaster(ctx, broadcastFunc, key, fromAddress, r.logger)
+	b := NewBroadcaster(ctx, broadcastFunc, key, fromAddress, r.logger, opts...)
 	r.broadcasters[key] = b
 	return b
 }
